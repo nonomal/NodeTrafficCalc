@@ -2,6 +2,7 @@
 import requests
 import yaml
 import time
+import json
 from datetime import datetime, timedelta, timezone
 import logging
 from logging import handlers
@@ -13,6 +14,7 @@ import re
 
 
 CONFIG_FILE = 'config.yaml'
+STATE_FILE = 'traffic_state.json'
 # 用于控制主循环的标志
 running = True
 # 日志记录器实例 (稍后配置)
@@ -210,6 +212,36 @@ def load_config():
         config['instances'] = []
 
     return config
+
+
+def load_state():
+    """加载保存的流量状态"""
+    try:
+        with open(STATE_FILE, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+            logger.debug(f"成功加载状态文件: {STATE_FILE}")
+            return state
+    except FileNotFoundError:
+        logger.info(f"状态文件 {STATE_FILE} 不存在，将创建新文件")
+        return {}
+    except json.JSONDecodeError as e:
+        logger.warning(f"状态文件 {STATE_FILE} 解析失败: {e}，将重新创建")
+        return {}
+    except Exception as e:
+        logger.error(f"加载状态文件时发生错误: {e}")
+        return {}
+
+
+def save_state(state):
+    """保存流量状态到文件"""
+    try:
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        logger.debug(f"成功保存状态到文件: {STATE_FILE}")
+        return True
+    except Exception as e:
+        logger.error(f"保存状态文件时发生错误: {e}")
+        return False
 
 
 def signal_handler(sig, frame):
@@ -417,7 +449,7 @@ def push_metric(pushgateway_url, push_job_name, instance, metric_name, help_text
 # --- 主处理逻辑 ---
 
 def process_instances(config):
-    """处理所有实例的流量计算和推送"""
+    """处理所有实例的流量计算和推送（增量累加模式）"""
     # 从传入的配置中获取参数
     prometheus_url = config['prometheus_url']
     pushgateway_url = config['pushgateway_url']
@@ -431,11 +463,14 @@ def process_instances(config):
         logger.warning("配置中未找到实例列表，本轮不处理。")
         return
 
+    # 加载保存的状态
+    state = load_state()
     now_ts = time.time() # 当前时间戳，用于 increase 计算的结束点
 
     success_pushes = 0
     failed_pushes = 0
     skipped_instances = 0
+    state_changed = False  # 标记状态是否有变化
 
     for item in instances:
         if not running:
@@ -486,68 +521,104 @@ def process_instances(config):
                         failed_pushes += 1
                 except (ValueError, TypeError):
                     logger.warning(f"无法解析 monthly_limit_gb: {limit_gb} for instance {instance_id}")
-            start_ts = get_billing_cycle_start(reset_day)
-            if start_ts is None:
+
+            # 获取计费周期开始时间
+            cycle_start_ts = get_billing_cycle_start(reset_day)
+            if cycle_start_ts is None:
                 logger.error(f"无法计算实例 {instance_id} 的计费开始时间，跳过。")
                 skipped_instances += 1
                 continue
 
-            # --- 计算 Increase 指标 ---
-            increase_tx = calculate_increase_value(prometheus_url, instance_id, base_metrics['tx'], device_filter_increase, start_ts, now_ts)
-            increase_rx = calculate_increase_value(prometheus_url, instance_id, base_metrics['rx'], device_filter_increase, start_ts, now_ts)
+            # --- 增量累加逻辑 ---
+            # 获取该实例的保存状态
+            instance_state = state.get(instance_id, {})
+            last_ts = instance_state.get('last_ts', cycle_start_ts)
+            last_cycle_start = instance_state.get('cycle_start', 0)
+            
+            # 检查是否是新的计费周期（需要重置累计值）
+            if cycle_start_ts != last_cycle_start:
+                logger.info(f"实例 {instance_id} 进入新计费周期，重置累计值")
+                cumulative_tx = 0
+                cumulative_rx = 0
+                last_ts = cycle_start_ts  # 从新周期开始计算
+            else:
+                cumulative_tx = instance_state.get('tx', 0)
+                cumulative_rx = instance_state.get('rx', 0)
+            
+            # 确保 last_ts 不早于 cycle_start_ts（防止计费周期内的异常情况）
+            if last_ts < cycle_start_ts:
+                last_ts = cycle_start_ts
+            
+            # 计算自上次以来的增量（短时间范围，避免长时间 increase 的精度问题）
+            delta_tx = calculate_increase_value(prometheus_url, instance_id, base_metrics['tx'], device_filter_increase, last_ts, now_ts)
+            delta_rx = calculate_increase_value(prometheus_url, instance_id, base_metrics['rx'], device_filter_increase, last_ts, now_ts)
+            
+            # 只累加正增量（负增量可能是 counter 重置后的异常值，忽略）
+            if delta_tx is not None and delta_tx > 0:
+                cumulative_tx += int(round(delta_tx))
+                logger.debug(f"实例 {instance_id} TX 增量: {delta_tx}, 累计: {cumulative_tx}")
+            elif delta_tx is not None and delta_tx < 0:
+                logger.warning(f"实例 {instance_id} TX 增量为负 ({delta_tx})，忽略此增量")
+            
+            if delta_rx is not None and delta_rx > 0:
+                cumulative_rx += int(round(delta_rx))
+                logger.debug(f"实例 {instance_id} RX 增量: {delta_rx}, 累计: {cumulative_rx}")
+            elif delta_rx is not None and delta_rx < 0:
+                logger.warning(f"实例 {instance_id} RX 增量为负 ({delta_rx})，忽略此增量")
+            
+            # 更新实例状态
+            state[instance_id] = {
+                'last_ts': now_ts,
+                'cycle_start': cycle_start_ts,
+                'tx': cumulative_tx,
+                'rx': cumulative_rx
+            }
+            state_changed = True
 
-            # --- 推送 TX Increase ---
+            # --- 推送累计值（而不是重新计算的 increase）---
             tx_metric_name = metric_names['tx_increase']
-            # 如果计算失败 (返回 None)，则推送时跳过；如果计算结果为 0，则推送 0
-            tx_value = int(round(increase_tx)) if increase_tx is not None else None
             if push_metric(pushgateway_url, push_job_name, instance_id, tx_metric_name,
-                           f"Bytes transmitted since last reset day (increase) for {instance_id}",
-                           tx_value, reset_day, custom_labels):
+                           f"Bytes transmitted since last reset day (cumulative) for {instance_id}",
+                           cumulative_tx, reset_day, custom_labels):
                 success_pushes += 1
-            elif tx_value is not None: # 仅当值不是 None 时才算推送失败
+            else:
                 failed_pushes += 1
 
-            # --- 推送 RX Increase ---
             rx_metric_name = metric_names['rx_increase']
-            rx_value = int(round(increase_rx)) if increase_rx is not None else None
-
             if push_metric(pushgateway_url, push_job_name, instance_id, rx_metric_name,
-                           f"Bytes received since last reset day (increase) for {instance_id}",
-                           rx_value, reset_day, custom_labels):
+                           f"Bytes received since last reset day (cumulative) for {instance_id}",
+                           cumulative_rx, reset_day, custom_labels):
                 success_pushes += 1
-            elif rx_value is not None:
+            else:
                 failed_pushes += 1
 
-            # --- 计算并推送 Total Increase ---
-            total_increase = None
-            # 只有在 TX 和 RX 都成功计算出数值 (不是 None) 时才相加
-            if tx_value is not None and rx_value is not None:
-                total_increase = tx_value + rx_value
-            elif tx_value is not None: # 如果只有 TX 成功
-                total_increase = tx_value
-            elif rx_value is not None: # 如果只有 RX 成功
-                total_increase = rx_value
-            # 如果两者都计算失败 (值为 None)，total_increase 保持 None
-
+            # 计算并推送总流量
+            total_cumulative = cumulative_tx + cumulative_rx
             total_metric_name = metric_names['total_increase']
             if push_metric(pushgateway_url, push_job_name, instance_id, total_metric_name,
-                           f"Total bytes (TX+RX) since last reset day (increase) for {instance_id}",
-                           total_increase, reset_day, custom_labels):
+                           f"Total bytes (TX+RX) since last reset day (cumulative) for {instance_id}",
+                           total_cumulative, reset_day, custom_labels):
                 success_pushes += 1
-            elif total_increase is not None:
+            else:
                 failed_pushes += 1
 
         except Exception as e:
             # 捕获处理单个实例时发生的任何未预料的错误
-            logger.error(f"处理实例 {instance_id} 时发生未知错误: {e}", exc_info=True) # exc_info=True 会记录堆栈跟踪
+            logger.error(f"处理实例 {instance_id} 时发生未知错误: {e}", exc_info=True)
             skipped_instances += 1
             # 继续处理下一个实例
 
         # 实例间短暂休眠，避免瞬间对 API 造成太大压力
-        if running: # 只有在还在运行时才休眠
+        if running:
              time.sleep(0.2)
 
+    # 保存状态到文件
+    if state_changed:
+        save_state(state)
+
     logger.info(f"本轮处理完成。成功推送: {success_pushes}, 推送失败: {failed_pushes}, 跳过实例: {skipped_instances}")
+
+
 
 
 def main_loop():
